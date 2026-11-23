@@ -1,326 +1,202 @@
-"""Mini-Lab 3: Feedback Kiosk (Raspberry Pi Pico / MicroPython).
-
-Visitor flow and manager alarm run as two independent state machines.
-In Wokwi, click the ultrasonic sensor and set its distance below 10 cm.
 """
-
-from machine import I2C, Pin, PWM, time_pulse_us
-from neopixel import NeoPixel
+# main.py
+# Raspberry Pi Pico 2 W display, three-button input and conference CRM startup.
+# Author: Codex
+"""
 import time
+from Log import *
+from crm import CRMController, CRMModel, CRMService
+
+# Set this to the same course server where you saved the customer.
+COURSE = "ism6205"
+MODE = "B"   # A preloads everything. B loads one customer's details on selection.
+PREFERRED_NAME = "Alexa Aguirre"
+# The published Lab 3 code used GP4/GP5. Also check GP0/GP1 from the physical setup.
+LCD_PINS = ((4, 5), (0, 1))
+NEXT_PIN, BACK_PIN, OPEN_PIN = 10, 11, 12
+STRIP_PIN, BUZZER_PIN = 6, 7
+BUTTON_ACTIVE_LOW = True
+PIXELS = 8
 
 
-# GPIO allocations (match diagram.json)
-TRIG_PIN = 2
-ECHO_PIN = 3
-SDA_PIN = 4
-SCL_PIN = 5
-STRIP_PIN = 6
-BUZZER_PIN = 7
-GREEN_PIN = 10
-RED_PIN = 11
-MANAGER_PIN = 12
+class PicoView:
+    """Display two lines, read the buttons, and signal activity history.
 
-DETECTION_CM = 10
-VOTE_TIMEOUT_MS = 8000
-RESULT_DURATION_MS = 3000
-LONG_PRESS_MS = 1200
-ALERT_THRESHOLD = 30
+    Parameters:
+    ----------
+    lcd : I2cLcd
+        Existing 16 by 2 LCD driver.
+    strip : NeoPixel
+        Eight addressable LEDs.
+    buzzer : PassiveBuzzer
+        Existing PicoLibrary buzzer driver.
+    buttons : tuple
+        Pairs of action name and GPIO input.
 
+    Examples:
+    ---------
+    view.show("Client 1/5", "Alexa Aguirre") displays a directory entry.
+    """
 
-class LCDDisplay:
-    """LCD 1602 over a PCF8574 I2C backpack, address 0x27."""
+    def __init__(self, lcd, strip, buzzer, buttons):
+        self.lcd = lcd
+        self.strip = strip
+        self.buzzer = buzzer
+        self.buttons = buttons
+        self.raw = self.stable = None
+        self.changed = time.ticks_ms()
+        self.lines = ("", "")
+        self.page = 0
+        self.last_page = self.changed
+        self.neutral()
 
-    BACKLIGHT = 0x08
-    ENABLE = 0x04
+    def _draw(self):
+        for line_index, line in enumerate(self.lines):
+            # Keep the shorter line steady while a longer line advances in 16-char pages.
+            pages = max(1, (len(line) + 15) // 16)
+            start = (self.page % pages) * 16
+            chunk = line[start:start + 16]
+            self.lcd.move_to(0, line_index)
+            self.lcd.putstr(chunk + " " * (16 - len(chunk)))
 
-    def __init__(self):
-        self.bus = I2C(0, sda=Pin(SDA_PIN), scl=Pin(SCL_PIN), freq=100000)
-        self.address = 0x27
-        self.last_lines = None
-        time.sleep_ms(50)
+    def show(self, heading, text):
+        """Print the complete message and display its first page immediately."""
+        self.lines = (heading, text)
+        self.page = 0
+        self.last_page = time.ticks_ms()
+        Log.i("PicoView.show | %s | %s" % (heading, text))
+        self._draw()
 
-        # Initialize the HD44780 controller in 4-bit mode.
-        for delay in (5, 5, 1):
-            self._pulse(0x30 | self.BACKLIGHT)
-            time.sleep_ms(delay)
-        self._pulse(0x20 | self.BACKLIGHT)
-        self._command(0x28)  # 4-bit, two lines
-        self._command(0x0C)  # display on, cursor off
-        self._command(0x06)  # auto-increment cursor
-        self._command(0x01)  # clear display
-        time.sleep_ms(2)
-
-    def _pulse(self, bits):
-        self.bus.writeto(self.address, bytes([bits | self.ENABLE]))
-        time.sleep_us(1)
-        self.bus.writeto(self.address, bytes([bits & ~self.ENABLE]))
-        time.sleep_us(50)
-
-    def _send(self, value, register_select):
-        high = (value & 0xF0) | self.BACKLIGHT | register_select
-        low = ((value << 4) & 0xF0) | self.BACKLIGHT | register_select
-        self._pulse(high)
-        self._pulse(low)
-
-    def _command(self, command):
-        self._send(command, 0)
-
-    def _write(self, character):
-        self._send(ord(character), 1)
-
-    def showMessage(self, line1, line2=""):
-        # MicroPython does not implement str.ljust().
-        lines = ((line1[:16] + " " * 16)[:16], (line2[:16] + " " * 16)[:16])
-        if lines == self.last_lines:
+    def refresh(self):
+        """Advance long names, roles or descriptions every 2.5 seconds."""
+        if max(len(line) for line in self.lines) <= 16:
             return
-        self.last_lines = lines
-        for line_index, line in enumerate(lines):
-            self._command(0x80 if line_index == 0 else 0xC0)
-            for character in line:
-                self._write(character)
-
-
-class UltrasonicSensor:
-    def __init__(self):
-        self.trig = Pin(TRIG_PIN, Pin.OUT)
-        self.echo = Pin(ECHO_PIN, Pin.IN)
-        self.trig.off()
-
-    def distanceCm(self):
-        self.trig.off()
-        time.sleep_us(2)
-        self.trig.on()
-        time.sleep_us(10)
-        self.trig.off()
-        try:
-            duration = time_pulse_us(self.echo, 1, 30000)
-            return duration / 58.0 if duration >= 0 else 999.0
-        except OSError:
-            return 999.0
-
-    def tripped(self):
-        return self.distanceCm() <= DETECTION_CM
-
-
-class LightStrip:
-    def __init__(self):
-        self.leds = NeoPixel(Pin(STRIP_PIN, Pin.OUT), 8)
-        self.current = None
-
-    def setColor(self, color):
-        if self.current == color:
-            return
-        self.current = color
-        for index in range(8):
-            self.leds[index] = color
-        self.leds.write()
-
-    def clear(self):
-        self.setColor((0, 0, 0))
-
-
-class PassiveBuzzer:
-    def __init__(self):
-        self.pwm = PWM(Pin(BUZZER_PIN))
-        self.pwm.freq(880)
-        self.pwm.duty_u16(0)
-
-    def playAlarm(self, now_ms):
-        # Intermittent beeping (non-blocking).
-        self.pwm.duty_u16(18000 if (now_ms // 350) % 2 == 0 else 0)
-
-    def stop(self):
-        self.pwm.duty_u16(0)
-
-
-class Button:
-    """Debounced button with short-press and long-press events."""
-
-    def __init__(self, gpio):
-        self.pin = Pin(gpio, Pin.IN, Pin.PULL_UP)
-        self.was_down = False
-        self.down_since = 0
-        self.raw_down = False
-        self.changed_at = time.ticks_ms()
-
-    def poll(self, now_ms):
-        down = self.pin.value() == 0
-        if down != self.raw_down:
-            self.raw_down = down
-            self.changed_at = now_ms
-        if time.ticks_diff(now_ms, self.changed_at) < 35:
-            return None
-        if down == self.was_down:
-            return None
-
-        self.was_down = down
-        if down:
-            self.down_since = now_ms
-            return "PRESS"
-        if time.ticks_diff(now_ms, self.down_since) >= LONG_PRESS_MS:
-            return "LONG"
-        return "SHORT"
-
-
-class FeedbackStats:
-    def __init__(self):
-        self.positiveVotes = 0
-        self.negativeVotes = 0
-
-    def recordVote(self, positive):
-        if positive:
-            self.positiveVotes += 1
-        else:
-            self.negativeVotes += 1
-
-    def total(self):
-        return self.positiveVotes + self.negativeVotes
-
-    def satisfaction(self):
-        return round(100 * self.positiveVotes / self.total()) if self.total() else 100
-
-    def reset(self):
-        self.positiveVotes = 0
-        self.negativeVotes = 0
-
-
-class StateModel:
-    def __init__(self):
-        self.visitor = "IDLE"
-        self.manager = "NORMAL"
-        self.started_at = time.ticks_ms()
-
-    def addTransition(self, new_state, now_ms):
-        self.visitor = new_state
-        self.started_at = now_ms
-
-    def processEvent(self, event_name):
-        # Events are dispatched by FeedbackController using the two state regions.
-        return event_name
-
-
-class FeedbackController:
-    def __init__(self):
-        self.display = LCDDisplay()
-        self.sensor = UltrasonicSensor()
-        self.strip = LightStrip()
-        self.buzzer = PassiveBuzzer()
-        self.green = Button(GREEN_PIN)
-        self.red = Button(RED_PIN)
-        self.manager = Button(MANAGER_PIN)
-        self.stats = FeedbackStats()
-        self.model = StateModel()
-        self.last_vote = None
-        self.showIdle()
-
-    def showIdle(self):
-        if self.model.manager != "NORMAL":
-            self.display.showMessage("MANAGER ALERT", "Needs attention")
-        else:
-            self.display.showMessage("Welcome!", "Move within 10cm")
-
-    def showPrompt(self):
-        self.display.showMessage("Rate your visit", "Green +  Red -")
-
-    def showResult(self):
-        response = "Thanks! Positive" if self.last_vote else "Thanks! Negative"
-        score = "Score: {}% ({})".format(self.stats.satisfaction(), self.stats.total())
-        self.display.showMessage(response, score)
-
-    def showStepAway(self):
-        self.display.showMessage("Thank you!", "Please step away")
-
-    def startAlert(self):
-        if self.model.manager == "NORMAL":
-            self.model.manager = "ALARM_SOUNDING"
-            print("ALERT: satisfaction below 30 percent")
-
-    def silenceAlarm(self):
-        if self.model.manager == "ALARM_SOUNDING":
-            self.model.manager = "ALARM_SILENCED"
-            self.buzzer.stop()
-            print("Manager silenced alarm")
-
-    def clearAlert(self):
-        self.model.manager = "NORMAL"
-        self.buzzer.stop()
-
-    def resetStats(self):
-        self.stats.reset()
-        self.clearAlert()
-        print("Manager reset feedback statistics")
-        if self.model.visitor == "IDLE":
-            self.showIdle()
-
-    def recordVote(self, positive):
-        self.stats.recordVote(positive)
-        self.last_vote = positive
-        print("Votes: +{} / -{} | Satisfaction: {}%".format(
-            self.stats.positiveVotes, self.stats.negativeVotes, self.stats.satisfaction()))
-        if self.stats.satisfaction() < ALERT_THRESHOLD:
-            self.startAlert()
-        elif self.model.manager != "NORMAL":
-            self.clearAlert()
-
-    def updateLights(self):
-        if self.model.manager != "NORMAL":
-            color = (45, 0, 0)
-        elif self.model.visitor == "AWAITING_VOTE":
-            color = (30, 24, 0)
-        elif self.model.visitor == "SHOWING_RESULT":
-            color = (0, 35, 5) if self.last_vote else (35, 8, 0)
-        elif self.model.visitor == "WAITING_FOR_LEAVE":
-            color = (0, 20, 25)
-        else:
-            color = (0, 0, 12)
-        self.strip.setColor(color)
-
-    def tick(self):
         now = time.ticks_ms()
-        green_event = self.green.poll(now)
-        red_event = self.red.poll(now)
-        manager_event = self.manager.poll(now)
+        if time.ticks_diff(now, self.last_page) >= 2500:
+            self.page += 1
+            self.last_page = now
+            self._draw()
 
-        # Independent manager region: short press = silence, long = reset.
-        if manager_event == "LONG":
-            self.resetStats()
-        elif manager_event == "SHORT":
-            self.silenceAlarm()
+    def read_button(self):
+        """Return one event per debounced press, including while a key is held."""
+        value = None
+        for action, pin in self.buttons:
+            if pin.value() == (0 if BUTTON_ACTIVE_LOW else 1):
+                value = action
+                break
+        now = time.ticks_ms()
+        if value != self.raw:
+            self.raw, self.changed = value, now
+        if self.stable != self.raw and time.ticks_diff(now, self.changed) >= 40:
+            self.stable = self.raw
+            return self.stable
+        return None
 
-        # Independent visitor region.
-        state = self.model.visitor
-        elapsed = time.ticks_diff(now, self.model.started_at)
+    def neutral(self):
+        """Turn off the previous customer's activity indicator."""
+        self.strip.fill((0, 0, 0))
+        self.strip.write()
 
-        if state == "IDLE":
-            if self.sensor.tripped():
-                self.model.addTransition("AWAITING_VOTE", now)
-                self.showPrompt()
-        elif state == "AWAITING_VOTE":
-            if green_event == "PRESS" or red_event == "PRESS":
-                self.recordVote(green_event == "PRESS")
-                self.model.addTransition("SHOWING_RESULT", now)
-                self.showResult()
-            elif elapsed >= VOTE_TIMEOUT_MS:
-                self.model.addTransition("WAITING_FOR_LEAVE", now)
-                self.showStepAway()
-        elif state == "SHOWING_RESULT":
-            if elapsed >= RESULT_DURATION_MS:
-                self.model.addTransition("WAITING_FOR_LEAVE", now)
-                self.showStepAway()
-        elif state == "WAITING_FOR_LEAVE":
-            if self.sensor.distanceCm() > DETECTION_CM:
-                self.model.addTransition("IDLE", now)
-                self.showIdle()
-
-        self.updateLights()
-        if self.model.manager == "ALARM_SOUNDING":
-            self.buzzer.playAlarm(now)
+    def signal(self, count):
+        """Show one green pixel per activity (up to eight), or red and one chirp for zero."""
+        self.neutral()
+        if count:
+            for i in range(min(count, PIXELS)):
+                self.strip[i] = (0, 16, 0)
         else:
-            self.buzzer.stop()
+            self.strip.fill((18, 0, 0))
+        self.strip.write()
+        Log.i("PicoView.signal: %d activities" % count)
+        if count == 0:
+            self.buzzer.beep(540, 100)
 
 
-controller = FeedbackController()
-print("Feedback kiosk ready. Set sensor distance below 10 cm to begin.")
-while True:
-    controller.tick()
-    time.sleep_ms(40)
+def make_view():
+    from machine import I2C, Pin
+    from neopixel import NeoPixel
+    from Buzzer import PassiveBuzzer
+    from pico_i2c_lcd import I2cLcd
+
+    lcd = None
+    for sda, scl in LCD_PINS:
+        bus = I2C(0, sda=Pin(sda), scl=Pin(scl), freq=100000)
+        try:
+            found = bus.scan()
+        except OSError:
+            continue
+        addresses = [a for a in found if 0x20 <= a <= 0x27 or 0x38 <= a <= 0x3F]
+        if addresses:
+            lcd = I2cLcd(bus, addresses[0], 2, 16)
+            Log.i("LCD found on GP%d/GP%d" % (sda, scl))
+            break
+    if lcd is None:
+        raise OSError("LCD not found on GP4/GP5 or GP0/GP1. Check the LCD pins.")
+    pull = Pin.PULL_UP if BUTTON_ACTIVE_LOW else Pin.PULL_DOWN
+    buttons = tuple((action, Pin(n, Pin.IN, pull)) for action, n in
+                    (("next", NEXT_PIN), ("back", BACK_PIN), ("open", OPEN_PIN)))
+    return PicoView(lcd, NeoPixel(Pin(STRIP_PIN, Pin.OUT), PIXELS),
+                    PassiveBuzzer(BUZZER_PIN), buttons)
+
+
+def connect_wifi():
+    """Read two lines from wifi.txt on the Pico only: hotspot name, then password."""
+    import network
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if wlan.isconnected():
+        return wlan
+    try:
+        with open("wifi.txt") as f:
+            ssid = f.readline().rstrip("\r\n")
+            password = f.readline().rstrip("\r\n")
+    except OSError:
+        raise OSError("Create wifi.txt on the Pico: hotspot name and password on separate lines")
+    wlan.connect(ssid, password)
+    start = time.ticks_ms()
+    while not wlan.isconnected():
+        if wlan.status() < 0 or time.ticks_diff(time.ticks_ms(), start) >= 20000:
+            wlan.disconnect()
+            raise OSError("Hotspot connection failed. Check wifi.txt and hotspot availability.")
+        time.sleep_ms(200)
+    return wlan
+
+
+def wait_after_error(view, exc):
+    Log.e("CRM error: %s" % exc)
+    view.neutral()
+    view.show("See Thonny error", "Yellow = retry")
+    while view.read_button() != "open":
+        time.sleep_ms(20)
+
+
+def run():
+    view = make_view()
+    model = CRMModel(CRMService("https://iacademy.oracle.com/ords/" + COURSE + "/customer"), MODE)
+    controller = CRMController(model, view, PREFERRED_NAME)
+    while True:
+        try:
+            view.show("Conference CRM", "Connecting Wi-Fi")
+            wlan = connect_wifi()
+            view.show("Wi-Fi connected", "Loading clients")
+            controller.start()
+            break
+        except (OSError, ValueError, MemoryError, ImportError) as exc:
+            wait_after_error(view, exc)
+    while True:
+        event = view.read_button()
+        if event:
+            while True:
+                try:
+                    needs_details = MODE == "B" and controller.screen == "directory" and event == "open"
+                    if needs_details and not wlan.isconnected():
+                        wlan = connect_wifi()
+                    controller.handle(event)
+                    break
+                except (OSError, ValueError, MemoryError, ImportError) as exc:
+                    wait_after_error(view, exc)
+        view.refresh()
+        time.sleep_ms(15)
+
+
+if __name__ == "__main__":
+    run()

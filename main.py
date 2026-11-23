@@ -8,7 +8,7 @@ from Log import *
 from crm import CRMController, CRMModel, CRMService
 
 # Set this to the same course server where you saved the customer.
-COURSE = "ism6205"
+COURSE = "ism6106"
 MODE = "B"   # A preloads everything. B loads one customer's details on selection.
 PREFERRED_NAME = "Alexa Aguirre"
 # The published Lab 3 code used GP4/GP5. Also check GP0/GP1 from the physical setup.

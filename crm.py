@@ -21,7 +21,7 @@ def elapsed(start):
 
 
 def key(text):
-    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+    return str(text).lower().replace("_", "").replace(" ", "").replace("-", "")
 
 
 def field(row, *names):

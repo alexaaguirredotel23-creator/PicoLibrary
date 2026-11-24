@@ -111,26 +111,46 @@ class PicoView:
             self.buzzer.beep(540, 100)
 
 
-def make_view():
+def open_lcd():
     from machine import I2C, Pin
-    from neopixel import NeoPixel
-    from Buzzer import PassiveBuzzer
     from pico_i2c_lcd import I2cLcd
 
-    lcd = None
     for sda, scl in LCD_PINS:
-        bus = I2C(0, sda=Pin(sda), scl=Pin(scl), freq=100000)
+        pins = "GP%d/GP%d" % (sda, scl)
         try:
+            bus = I2C(0, sda=Pin(sda), scl=Pin(scl), freq=100000)
             found = bus.scan()
-        except OSError:
-            continue
-        addresses = [a for a in found if 0x20 <= a <= 0x27 or 0x38 <= a <= 0x3F]
-        if addresses:
-            lcd = I2cLcd(bus, addresses[0], 2, 16)
-            Log.i("LCD found on GP%d/GP%d" % (sda, scl))
-            break
-    if lcd is None:
-        raise OSError("LCD not found on GP4/GP5 or GP0/GP1. Check the LCD pins.")
+        except OSError as exc:
+            Log.i("LCD scan failed on %s: %s" % (pins, exc))
+            found = []
+        else:
+            if len(found) == 0x78 - 0x08:
+                Log.i("LCD scan %s: every address responded; check SDA and SCL." % pins)
+                found = []
+            else:
+                Log.i("LCD scan %s: %s" % (pins, [hex(a) for a in found]))
+        for address in found:
+            if not (0x20 <= address <= 0x27 or 0x38 <= address <= 0x3F):
+                continue
+            try:
+                lcd = I2cLcd(bus, address, 2, 16)
+            except OSError as exc:
+                Log.i("LCD write failed on %s at %s: %s" % (pins, hex(address), exc))
+                continue
+            Log.i("LCD ready on %s at %s" % (pins, hex(address)))
+            return lcd
+        # Disconnect the old pins before assigning the same I2C controller to the next pair.
+        Pin(sda, Pin.IN)
+        Pin(scl, Pin.IN)
+    raise OSError("LCD did not initialize. Check its SDA, SCL, power and ground connections.")
+
+
+def make_view():
+    from machine import Pin
+    from neopixel import NeoPixel
+    from Buzzer import PassiveBuzzer
+
+    lcd = open_lcd()
     pull = Pin.PULL_UP if BUTTON_ACTIVE_LOW else Pin.PULL_DOWN
     buttons = tuple((action, Pin(n, Pin.IN, pull)) for action, n in
                     (("next", NEXT_PIN), ("back", BACK_PIN), ("open", OPEN_PIN)))
